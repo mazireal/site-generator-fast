@@ -17,41 +17,27 @@ const byCodeUnits = (a, b) => (a < b ? -1 : a > b ? 1 : 0);
 const dirOf = (path) => (path.includes('/') ? path.slice(0, path.lastIndexOf('/')) : '');
 
 const ESC_RE = /[&<>"']/;
+const ESC_RE_G = /[&<>"']/g;
 
 /** HTML-escape `s`, scanning once and copying only around escapes. */
 function esc(s) {
-  if (!ESC_RE.test(s)) return s;
-  let out = '';
-  let start = 0;
-  for (let i = 0; i < s.length; i++) {
-    const r = ESCAPES[s[i]];
-    if (r !== undefined) {
-      out += s.slice(start, i) + r;
-      start = i + 1;
-    }
-  }
-  return out + s.slice(start);
+  return ESC_RE.test(s) ? s.replace(ESC_RE_G, (c) => ESCAPES[c]) : s;
 }
+
+const NON_ASCII = /[^\x00-\x7F]/;
 
 /** The slug of `text`: NFKD, combining marks dropped, runs of other chars one `-`. */
 function slugifyRaw(text) {
-  const plain = text.normalize('NFKD').replace(/\p{M}/gu, '');
-  let out = '';
-  let gap = false;
-  for (const ch of plain) {
-    let keep = null;
-    if (ch >= 'A' && ch <= 'Z') keep = ch.toLowerCase();
-    else if ((ch >= 'a' && ch <= 'z') || (ch >= '0' && ch <= '9')) keep = ch;
-    if (keep === null) {
-      gap = out.length > 0;
-      continue;
-    }
-    if (gap) out += '-';
-    gap = false;
-    out += keep;
-  }
-  out = out.slice(0, 64).replace(/-+$/, '');
-  return out === '' ? 'untitled' : out;
+  // ASCII text needs no normalisation: NFKD and mark-stripping are identities on it.
+  let s = NON_ASCII.test(text) ? text.normalize('NFKD').replace(/\p{M}/gu, '') : text;
+  s = s.replace(/[^a-zA-Z0-9]+/g, '-');
+  if (s.charCodeAt(0) === 45) s = s.slice(1);
+  s = s.slice(0, 64);
+  let end = s.length;
+  while (end > 0 && s.charCodeAt(end - 1) === 45) end--;
+  if (end !== s.length) s = s.slice(0, end);
+  s = s.toLowerCase();
+  return s === '' ? 'untitled' : s;
 }
 
 /** `slug` made unique against `taken` (and added to it). */
@@ -67,13 +53,10 @@ function longDateRaw(date) {
   return `${Number(date.slice(8, 10))} ${MONTHS[Number(date.slice(5, 7)) - 1]} ${date.slice(0, 4)}`;
 }
 
-/** Whether a code unit is JavaScript whitespace (`\s`). */
-function isSpace(c) {
-  return (
-    c === 9 || c === 10 || c === 11 || c === 12 || c === 13 || c === 32 || c === 160 || c === 5760 ||
-    (c >= 8192 && c <= 8202) || c === 8232 || c === 8233 || c === 8239 || c === 8287 || c === 12288 || c === 65279
-  );
-}
+/** Whether a code unit is JavaScript whitespace (`\s`), as a lookup table. */
+const WS = new Uint8Array(65536);
+for (const c of [9, 10, 11, 12, 13, 32, 160, 5760, 8232, 8233, 8239, 8287, 12288, 65279]) WS[c] = 1;
+for (let c = 8192; c <= 8202; c++) WS[c] = 1;
 
 /** The words of `lines` from `start`: runs of characters other than whitespace. */
 function countWords(lines, start) {
@@ -82,7 +65,7 @@ function countWords(lines, start) {
     const line = lines[i];
     let inWord = false;
     for (let j = 0; j < line.length; j++) {
-      if (isSpace(line.charCodeAt(j))) inWord = false;
+      if (WS[line.charCodeAt(j)]) inWord = false;
       else if (!inWord) {
         inWord = true;
         w++;
@@ -92,8 +75,12 @@ function countWords(lines, start) {
   return w;
 }
 
+const SLOW_PATH_RE = /(^|\/)\.{1,2}(\/|$)|(\/\/)|(^\/)|(\/$)/;
+
 /** `rel` resolved from directory `dir`, or null when it climbs out of the root. */
 function resolvePath(dir, rel) {
+  // Fast path: no '..', '.', or empty segment — a plain join.
+  if (!SLOW_PATH_RE.test(rel)) return dir === '' ? rel : `${dir}/${rel}`;
   const parts = dir === '' ? [] : dir.split('/');
   for (const seg of rel.split('/')) {
     if (seg === '' || seg === '.') continue;
@@ -339,34 +326,54 @@ function renderList(lines, i, n, isOrdered, firstText, firstStart, env) {
   return [`${open}\n${items.map((parts) => `<li>${inline(parts.join('\n'), env)}</li>\n`).join('')}</${tag}>\n`, i];
 }
 
-/** The first index from `from` where `s` holds `what` outside a backslash escape, or -1. */
+/** The first index from `from` where `s` holds `what` outside a backslash escape, or -1.
+ * A run of backslashes before the match escapes it exactly when the run is odd:
+ * the scanner pairs backslashes left to right, so an odd run leaves one to
+ * escape the match's first character. */
 function findUnescaped(s, what, from) {
-  for (let j = from; j <= s.length - what.length; j++) {
-    if (s[j] === '\\' && j + 1 < s.length && ESCAPABLE.has(s[j + 1])) {
-      j++;
-      continue;
+  let j = s.indexOf(what, from);
+  while (j !== -1) {
+    let k = j - 1;
+    let n = 0;
+    while (k >= from && s[k] === '\\') {
+      n++;
+      k--;
     }
-    if (s.startsWith(what, j)) return j;
+    if (n % 2 === 0) return j;
+    j = s.indexOf(what, j + 1);
   }
   return -1;
 }
 
 /** The first single `*` from `from` (one whose run is not `**`), outside an escape, or -1. */
 function findSingleStar(s, from) {
-  for (let j = from; j < s.length; j++) {
-    const c = s[j];
-    if (c === '\\' && j + 1 < s.length && ESCAPABLE.has(s[j + 1])) {
-      j++;
+  let j = s.indexOf('*', from);
+  while (j !== -1) {
+    let k = j - 1;
+    let n = 0;
+    while (k >= from && s[k] === '\\') {
+      n++;
+      k--;
+    }
+    if (n % 2 === 1) {
+      j = s.indexOf('*', j + 1);
       continue;
     }
-    if (c !== '*') continue;
     if (s[j + 1] === '*') {
-      j++;
+      j = s.indexOf('*', j + 2);
       continue;
     }
     return j;
   }
   return -1;
+}
+
+/** Whether `s` holds a character inline rendering handles. */
+const INLINE_SPECIAL = /[\\`*\[&<>"']/;
+
+/** `s` rendered inline, or itself when it holds no character inline handles. */
+function inlinePlain(s, env) {
+  return INLINE_SPECIAL.test(s) ? inline(s, env) : s;
 }
 
 /** `s` rendered inline; `env.link(target)` resolves a link's href. A regex
@@ -383,7 +390,9 @@ function inline(s, env) {
     if (j > i) out += s.slice(i, j);
     if (c === '\\') {
       if (j + 1 < s.length && ESCAPABLE.has(s[j + 1])) {
-        out += s[j + 1];
+        // The escaped character is itself HTML-escaped: of the escapable
+        // characters only '>' changes under escaping.
+        out += s[j + 1] === '>' ? '&gt;' : s[j + 1];
         i = j + 2;
       } else {
         out += '\\';
@@ -408,7 +417,7 @@ function inline(s, env) {
       if (s[j + 1] === '*') {
         const k = findUnescaped(s, '**', j + 2);
         if (k > j + 2) {
-          out += `<strong>${inline(s.slice(j + 2, k), env)}</strong>`;
+          out += `<strong>${inlinePlain(s.slice(j + 2, k), env)}</strong>`;
           i = k + 2;
         } else {
           out += '**';
@@ -417,7 +426,7 @@ function inline(s, env) {
       } else {
         const k = findSingleStar(s, j + 1);
         if (k > j + 1) {
-          out += `<em>${inline(s.slice(j + 1, k), env)}</em>`;
+          out += `<em>${inlinePlain(s.slice(j + 1, k), env)}</em>`;
           i = k + 1;
         } else {
           out += '*';
@@ -432,7 +441,7 @@ function inline(s, env) {
       const p = k !== -1 && s[k + 1] === '(' ? s.indexOf(')', k + 2) : -1;
       const target = p === -1 ? '' : s.slice(k + 2, p);
       if (target !== '' && !/\s/.test(target)) {
-        out += `<a href="${esc(env.link(target))}">${inline(s.slice(j + 1, k), env)}</a>`;
+        out += `<a href="${esc(env.link(target))}">${inlinePlain(s.slice(j + 1, k), env)}</a>`;
         i = p + 1;
       } else {
         out += '[';
@@ -480,7 +489,9 @@ function renderMarkdown(lines, start, env, slugOf) {
         while (i < n && !fenceClose(lines[i])) body.push(lines[i++]);
         i++;
         const cls = fence === '' ? '' : ` class="language-${esc(fence)}"`;
-        out.push(`<pre><code${cls}>${body.map((l) => `${esc(l)}\n`).join('')}</code></pre>\n`);
+        out.push(`<pre><code${cls}>`);
+        for (const l of body) out.push(esc(l), '\n');
+        out.push('</code></pre>\n');
         continue;
       }
     } else if (c0 === 35) {
@@ -508,8 +519,12 @@ function renderMarkdown(lines, start, env, slugOf) {
       }
     } else if (c0 === 62) {
       const body = [];
-      while (i < n && lines[i][0] === '>') body.push(lines[i++].replace(/^> ?/, ''));
-      const inner = body.map(trimLine).filter((l) => l !== '');
+      while (i < n) {
+        const l = lines[i];
+        if (l[0] !== '>') break;
+        body.push(l[1] === ' ' ? l.slice(2) : l.slice(1));
+        i++;
+      }      const inner = body.map(trimLine).filter((l) => l !== '');
       out.push(inner.length === 0 ? '<blockquote>\n</blockquote>\n' : `<blockquote>\n<p>${inline(inner.join('\n'), env)}</p>\n</blockquote>\n`);
       continue;
     } else if (c0 >= 48 && c0 <= 57) {
@@ -713,14 +728,38 @@ function compileTemplate(nodes) {
   const emitLookup = (path) => {
     const hv = hoisted.get(path.join('.'));
     if (hv !== undefined) return hv;
+    // A name this template's own `for`s bind resolves to the innermost such
+    // scope. While this template's code runs, its own scopes are the topmost
+    // entries of S (an include's scopes are pushed above and popped before
+    // this code resumes), so the depth from the top is statically known and
+    // the scope walk can be a single index. A bound name with no active
+    // scope here falls through to lk, which keeps dynamic scoping. (`loop`
+    // is bound by every `for`, so it is the innermost scope.)
+    let idx = -1;
+    if (path[0] === 'loop') idx = scopes.length - 1;
+    else {
+      for (let k = scopes.length - 1; k >= 0; k--) {
+        if (scopes[k] === path[0]) {
+          idx = k;
+          break;
+        }
+      }
+    }
     const t = next();
-    lines.push(`let ${t} = lk(S, R, ${JSON.stringify(path[0])});`);
+    if (idx !== -1) {
+      lines.push(`let ${t} = S[S.length - 1 - ${scopes.length - 1 - idx}][${JSON.stringify(path[0])}];`);
+    } else {
+      lines.push(`let ${t} = lk(S, R, ${JSON.stringify(path[0])});`);
+    }
     for (let k = 1; k < path.length; k++) {
       const p = JSON.stringify(path[k]);
       lines.push(`${t} = ${t} !== null && typeof ${t} === "object" && Object.hasOwn(${t}, ${p}) ? ${t}[${p}] : undefined;`);
     }
     return t;
   };
+  // The variable names the active `for` scopes bind, innermost last (one
+  // entry per scope object; each scope also holds `loop`).
+  const scopes = [];
   const emitNodes = (ns) => {
     for (const node of ns) emit(node);
   };
@@ -756,7 +795,9 @@ function compileTemplate(nodes) {
         const k = next();
         lines.push(`{ const ${xs} = ${t}; if (Array.isArray(${xs})) { for (let ${k} = 0; ${k} < ${xs}.length; ${k}++) {`);
         lines.push(`S.push({ [${JSON.stringify(node.name)}]: ${xs}[${k}], loop: { index: ${k} + 1, first: ${k} === 0, last: ${k} === ${xs}.length - 1, length: ${xs}.length } });`);
+        scopes.push(node.name);
         emitNodes(node.body);
+        scopes.pop();
         lines.push(`S.pop(); } } }`);
         break;
       }
@@ -812,8 +853,10 @@ export function run(input) {
   const sources = [];
   const statics = [];
   for (const f of files) {
-    if (f.path.endsWith('.md')) sources.push({ path: f.path, lines: f.content.replace(/\r\n?/g, '\n').split('\n') });
-    else statics.push(f);
+    if (f.path.endsWith('.md')) {
+      const c = f.content;
+      sources.push({ path: f.path, lines: (c.indexOf('\r') === -1 ? c : c.replace(/\r\n?/g, '\n')).split('\n') });
+    } else statics.push(f);
   }
 
   // Front matter and the refusal checks, in order; a draft is reported and dropped.
@@ -878,8 +921,11 @@ export function run(input) {
         const rel = hash === -1 ? target : target.slice(0, hash);
         const frag = hash === -1 ? '' : target.slice(hash);
         const path = rel === '' ? null : resolvePath(dir, rel);
-        if (path !== null && bySource.has(path)) return `${bySource.get(path).url}${frag}`;
-        if (path !== null && staticPaths.has(path)) return `${base}/${path}${frag}`;
+        if (path !== null) {
+          const page = bySource.get(path);
+          if (page !== undefined) return `${page.url}${frag}`;
+          if (staticPaths.has(path)) return `${base}/${path}${frag}`;
+        }
         broken.add(`broken-link ${s.path} -> ${target}`);
         return target;
       },
@@ -889,6 +935,7 @@ export function run(input) {
     s.toc = md.toc;
     s.excerpt = md.excerpt;
     s.words = countWords(s.lines, s.bodyStart);
+    s.readingMinutes = Math.max(1, Math.ceil(s.words / 200));
   }
 
   // Collections: posts newest first, equal dates by slug; each post's neighbours.
@@ -931,7 +978,8 @@ export function run(input) {
   }
   const tags = [...bySlug.values()].sort((x, y) => y.posts.length - x.posts.length || byCodeUnits(x.slug, y.slug));
 
-  // The records templates read.
+  // The tag cards every record of a page carries, built once per page.
+  for (const s of kept) s.tagCards = s.tagRefs.map((t) => ({ name: t.name, slug: t.slug, url: t.url }));
   const cardOf = (s) => ({
     title: s.data.title,
     url: s.url,
@@ -939,15 +987,22 @@ export function run(input) {
     date_long: s.data.date === undefined ? '' : longOf(s.data.date),
     summary: s.data.summary ?? '',
     excerpt: s.excerpt,
-    reading_minutes: Math.max(1, Math.ceil(s.words / 200)),
-    tags: s.tagRefs.map((t) => ({ name: t.name, slug: t.slug, url: t.url })),
+    reading_minutes: s.readingMinutes,
+    tags: s.tagCards,
   });
   const linkOf = (s) => (s === null ? null : { title: s.data.title, url: s.url, date: s.data.date ?? '', date_long: s.data.date === undefined ? '' : longOf(s.data.date) });
   const pageOf = (s) => ({
-    ...cardOf(s),
+    title: s.data.title,
+    url: s.url,
+    date: s.data.date ?? '',
+    date_long: s.data.date === undefined ? '' : longOf(s.data.date),
+    summary: s.data.summary ?? '',
+    excerpt: s.excerpt,
+    reading_minutes: s.readingMinutes,
+    tags: s.tagCards,
     slug: s.slug,
     content: s.html,
-    toc: s.toc.map((h) => ({ level: h.level, id: h.id, html: h.html })),
+    toc: s.toc,
     newer: linkOf(s.newer ?? null),
     older: linkOf(s.older ?? null),
     is_post: s.post,
@@ -960,25 +1015,28 @@ export function run(input) {
   const recent = posts.slice(0, input.site.recent).map((p) => cards.get(p));
   const render = (name, vars) => {
     const fn = templates.get(name);
-    return fn === undefined ? null : fn({ site, tags: allTags, recent, ...vars }, [], templates, 0, lk, textOf, truthy, esc);
+    return fn === undefined ? null : fn(vars, [], templates, 0, lk, textOf, truthy, esc);
   };
   const output = {};
-  for (const s of kept) output[`${s.outDir}/index.html`] = render(s.layout, { page: pageOf(s) });
+  for (const s of kept) output[`${s.outDir}/index.html`] = render(s.layout, { site, tags: allTags, recent, page: pageOf(s) });
   const per = input.site.per_page;
   const pages = Math.max(1, Math.ceil(posts.length / per));
   const indexUrl = (k) => (k === 1 ? `${base}/` : `${base}/page/${k}/`);
   for (let k = 1; k <= pages; k++) {
     const html = render('index', {
+      site,
+      tags: allTags,
+      recent,
       posts: posts.slice((k - 1) * per, k * per).map((p) => cards.get(p)),
       pager: { number: k, total: pages, url: indexUrl(k), newer_url: k === 1 ? '' : indexUrl(k - 1), older_url: k === pages ? '' : indexUrl(k + 1) },
     });
     if (html !== null) output[k === 1 ? 'index.html' : `page/${k}/index.html`] = html;
   }
   for (const t of tags) {
-    const html = render('tag', { tag: { name: t.name, slug: t.slug, url: t.url, count: t.posts.length, posts: t.posts.map((p) => cards.get(p)) } });
+    const html = render('tag', { site, tags: allTags, recent, tag: { name: t.name, slug: t.slug, url: t.url, count: t.posts.length, posts: t.posts.map((p) => cards.get(p)) } });
     if (html !== null) output[`tags/${t.slug}/index.html`] = html;
   }
-  const tagsHtml = render('tags', {});
+  const tagsHtml = render('tags', { site, tags: allTags, recent });
   if (tagsHtml !== null) output['tags/index.html'] = tagsHtml;
   for (const f of statics) {
     if (Object.hasOwn(output, f.path)) report.push(`shadowed ${f.path}: a built page has its path`);
