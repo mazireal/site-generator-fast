@@ -957,6 +957,30 @@ function compileTemplate(name, nodes, allNodes, constant) {
 
 /** One site's output tree: path -> text. */
 export function run(input) {
+  const output = {};
+  build(input, (p, t) => {
+    output[p] = t;
+  });
+  return output;
+}
+
+/**
+ * The same build, streaming each output entry (path, text) to `cb` in the
+ * order run() inserts them into its object, instead of building that object:
+ * the caller writes each page's JSON as it is rendered, so neither the
+ * answers object nor its stringified blob ever exists whole.
+ */
+export function runEach(input, cb) {
+  build(input, cb);
+}
+
+/** The build: every output entry handed to `emit` in run()'s order. */
+function build(input, out) {
+  const seen = new Set();
+  const emit = (p, t) => {
+    seen.add(p);
+    out(p, t);
+  };
   const slugCache = new Map();
   const dateCache = new Map();
   const slugOf = (t) => {
@@ -1180,7 +1204,6 @@ export function run(input) {
     const fn = templates.get(name);
     return fn === undefined ? null : fn(R, [], templates, 0, lk, textOf, truthy, esc, constRenders);
   };
-  const output = {};
   let pageCount = 0;
   for (const s of kept) {
     R.page = s.rec;
@@ -1188,7 +1211,7 @@ export function run(input) {
     R.pager = undefined;
     R.tag = undefined;
     if (!s.post) pageCount++;
-    output[`${s.outDir}/index.html`] = render(s.layout);
+    emit(`${s.outDir}/index.html`, render(s.layout));
   }
   const per = input.site.per_page;
   const pages = Math.max(1, Math.ceil(posts.length / per));
@@ -1199,7 +1222,7 @@ export function run(input) {
     R.pager = { number: k, total: pages, url: indexUrl(k), newer_url: k === 1 ? '' : indexUrl(k - 1), older_url: k === pages ? '' : indexUrl(k + 1) };
     R.tag = undefined;
     const html = render('index');
-    if (html !== null) output[k === 1 ? 'index.html' : `page/${k}/index.html`] = html;
+    if (html !== null) emit(k === 1 ? 'index.html' : `page/${k}/index.html`, html);
   }
   for (const t of tags) {
     R.page = undefined;
@@ -1207,22 +1230,21 @@ export function run(input) {
     R.pager = undefined;
     R.tag = { name: t.name, slug: t.slug, url: t.url, count: t.posts.length, posts: t.posts.map((p) => p.rec) };
     const html = render('tag');
-    if (html !== null) output[`tags/${t.slug}/index.html`] = html;
+    if (html !== null) emit(`tags/${t.slug}/index.html`, html);
   }
   R.page = undefined;
   R.posts = undefined;
   R.pager = undefined;
   R.tag = undefined;
   const tagsHtml = render('tags');
-  if (tagsHtml !== null) output['tags/index.html'] = tagsHtml;
+  if (tagsHtml !== null) emit('tags/index.html', tagsHtml);
   for (const f of statics) {
-    if (Object.hasOwn(output, f.path)) report.push(`shadowed ${f.path}: a built page has its path`);
-    else output[f.path] = f.content;
+    if (seen.has(f.path)) report.push(`shadowed ${f.path}: a built page has its path`);
+    else emit(f.path, f.content);
   }
 
   // The report: every line reported above and each broken link, sorted, then the counts.
   const lines = [...report, ...broken].sort(byCodeUnits);
   lines.push(`built ${pageCount} pages, ${posts.length} posts, ${tags.length} tags and ${statics.length} static files`);
-  output['build-report.txt'] = `${lines.join('\n')}\n`;
-  return output;
+  emit('build-report.txt', `${lines.join('\n')}\n`);
 }
