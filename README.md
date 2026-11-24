@@ -17,9 +17,22 @@ report — in a single dependency-free ES module, tuned for speed:
 
 - one shared line split per source, feeding both front matter and Markdown;
 - a single-pass Markdown renderer with chunked inline scanning and a
-  fast HTML escaper (no per-character regex);
+  fast HTML escaper (no per-character regex), with word counting folded
+  into the render pass;
 - cached slug and long-date computation;
-- templates parsed once per case and rendered by a small tree walker.
+- a manual (no split/join) path resolver;
+- templates compiled once per case to plain JS functions; constant
+  includes are inlined at compile time, and case-constant templates
+  (only `site`/`tags`/`recent` data, no loop-variable shadowing) are
+  pre-rendered once per case and reused;
+- shared card/page records, precomputed pager links, and a single reused
+  render-vars object per case.
+
+`stress/run.mjs` diffs this solver against the baseline makefun-site on the
+practice set, on extra generator-drawn sets, and on hand-crafted edge
+cases (template cycles, deep include chains, loop vars shadowing
+`site`/`tags`/`recent`, front-matter and Markdown edge cases, slug
+collisions, shadowed statics, degenerate inputs).
 
 `main.ts` is the driver the harness runs: it reads every case from
 `/input/cases.json`, answers each with `run`, and writes

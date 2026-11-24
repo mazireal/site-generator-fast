@@ -58,38 +58,29 @@ const WS = new Uint8Array(65536);
 for (const c of [9, 10, 11, 12, 13, 32, 160, 5760, 8232, 8233, 8239, 8287, 12288, 65279]) WS[c] = 1;
 for (let c = 8192; c <= 8202; c++) WS[c] = 1;
 
-/** The words of `lines` from `start`: runs of characters other than whitespace. */
-function countWords(lines, start) {
-  let w = 0;
-  for (let i = start; i < lines.length; i++) {
-    const line = lines[i];
-    let inWord = false;
-    for (let j = 0; j < line.length; j++) {
-      if (WS[line.charCodeAt(j)]) inWord = false;
-      else if (!inWord) {
-        inWord = true;
-        w++;
-      }
-    }
-  }
-  return w;
-}
-
 const SLOW_PATH_RE = /(^|\/)\.{1,2}(\/|$)|(\/\/)|(^\/)|(\/$)/;
+const SCHEME_RE = /^[A-Za-z][A-Za-z0-9+.-]*:/;
 
 /** `rel` resolved from directory `dir`, or null when it climbs out of the root. */
 function resolvePath(dir, rel) {
   // Fast path: no '..', '.', or empty segment — a plain join.
   if (!SLOW_PATH_RE.test(rel)) return dir === '' ? rel : `${dir}/${rel}`;
-  const parts = dir === '' ? [] : dir.split('/');
-  for (const seg of rel.split('/')) {
-    if (seg === '' || seg === '.') continue;
+  // Slow path, walked by hand over one string: no split arrays, no join.
+  let res = dir;
+  let i = 0;
+  const n = rel.length;
+  while (i < n) {
+    let j = rel.indexOf('/', i);
+    if (j === -1) j = n;
+    const seg = rel.slice(i, j);
     if (seg === '..') {
-      if (parts.length === 0) return null;
-      parts.pop();
-    } else parts.push(seg);
+      if (res === '') return null;
+      const cut = res.lastIndexOf('/');
+      res = cut === -1 ? '' : res.slice(0, cut);
+    } else if (seg !== '' && seg !== '.') res = res === '' ? seg : `${res}/${seg}`;
+    i = j + 1;
   }
-  return parts.join('/');
+  return res;
 }
 
 // ---------------------------------------------------------------- front matter
@@ -199,7 +190,14 @@ function parseFrontMatter(lines) {
     if (rest === '') raw = '';
     else if (rest[0] === ' ') raw = rest.slice(1);
     else return { error: `line ${i + 1} is not "key: value"` };
-    raw = raw.replace(/[ \t]+$/, '');
+    // The value's trailing spaces and tabs, dropped without a regex.
+    let end = raw.length;
+    while (end > 0) {
+      const c = raw.charCodeAt(end - 1);
+      if (c !== 32 && c !== 9) break;
+      end--;
+    }
+    if (end !== raw.length) raw = raw.slice(0, end);
     if (!KEYS.has(key)) return { error: `unknown key "${key}"` };
     if (Object.hasOwn(data, key)) return { error: `key "${key}" is given twice` };
     if (raw === '') return { error: `key "${key}" has no value` };
@@ -308,15 +306,17 @@ function paraEnds(line) {
 }
 
 /** A list starting at `lines[i]` (`firstText` its first item's text, `firstStart` its first number) rendered, with the next line index. */
-function renderList(lines, i, n, isOrdered, firstText, firstStart, env) {
+function renderList(lines, i, n, isOrdered, firstText, firstStart, env, addWords) {
   const items = [[trimLine(firstText)]];
   i++;
   while (i < n) {
     const m = isOrdered ? orderedOf(lines[i]) : bulletOf(lines[i]);
     if (m !== null) {
+      addWords(lines[i]);
       items.push([trimLine(isOrdered ? m.text : m)]);
       i++;
     } else if (isContinued(lines[i])) {
+      addWords(lines[i]);
       items[items.length - 1].push(trimLine(lines[i]));
       i++;
     } else break;
@@ -459,17 +459,32 @@ function inline(s, env) {
 
 /**
  * `lines` from `start` rendered: its HTML, its table of contents (level 2
- * and 3 headings) and its excerpt (the first paragraph's inline HTML).
+ * and 3 headings), its excerpt (the first paragraph's inline HTML) and its
+ * word count (the body's words, runs of characters other than whitespace).
+ * Every body line is consumed exactly once below, so the words are counted
+ * as the lines are consumed instead of in a separate pass.
  */
 function renderMarkdown(lines, start, env, slugOf) {
   const ids = new Set();
   const out = [];
   const toc = [];
   let excerpt = null;
+  let words = 0;
+  const addWords = (line) => {
+    let inWord = false;
+    for (let j = 0; j < line.length; j++) {
+      if (WS[line.charCodeAt(j)]) inWord = false;
+      else if (!inWord) {
+        inWord = true;
+        words++;
+      }
+    }
+  };
   let i = start;
   const n = lines.length;
   while (i < n) {
     const line = lines[i];
+    addWords(line);
     if (line === '') {
       i++;
       continue;
@@ -486,11 +501,15 @@ function renderMarkdown(lines, start, env, slugOf) {
       if (fence !== null) {
         const body = [];
         i++;
-        while (i < n && !fenceClose(lines[i])) body.push(lines[i++]);
+        while (i < n && !fenceClose(lines[i])) {
+          addWords(lines[i]);
+          body.push(lines[i++]);
+        }
+        if (i < n) addWords(lines[i]);
         i++;
         const cls = fence === '' ? '' : ` class="language-${esc(fence)}"`;
         out.push(`<pre><code${cls}>`);
-        for (const l of body) out.push(esc(l), '\n');
+        if (body.length !== 0) out.push(esc(body.join('\n')), '\n');
         out.push('</code></pre>\n');
         continue;
       }
@@ -512,16 +531,19 @@ function renderMarkdown(lines, start, env, slugOf) {
       }
       const bullet = bulletOf(line);
       if (bullet !== null) {
-        const r = renderList(lines, i, n, false, bullet, 1, env);
+        const r = renderList(lines, i, n, false, bullet, 1, env, addWords);
         out.push(r[0]);
         i = r[1];
         continue;
       }
     } else if (c0 === 62) {
       const body = [];
+      let first = true;
       while (i < n) {
         const l = lines[i];
         if (l[0] !== '>') break;
+        if (!first) addWords(l);
+        first = false;
         body.push(l[1] === ' ' ? l.slice(2) : l.slice(1));
         i++;
       }      const inner = body.map(trimLine).filter((l) => l !== '');
@@ -530,7 +552,7 @@ function renderMarkdown(lines, start, env, slugOf) {
     } else if (c0 >= 48 && c0 <= 57) {
       const ordered = orderedOf(line);
       if (ordered !== null) {
-        const r = renderList(lines, i, n, true, ordered.text, ordered.start, env);
+        const r = renderList(lines, i, n, true, ordered.text, ordered.start, env, addWords);
         out.push(r[0]);
         i = r[1];
         continue;
@@ -538,12 +560,15 @@ function renderMarkdown(lines, start, env, slugOf) {
     }
     const body = [trimLine(line)];
     i++;
-    while (i < n && !paraEnds(lines[i])) body.push(trimLine(lines[i++]));
+    while (i < n && !paraEnds(lines[i])) {
+      addWords(lines[i]);
+      body.push(trimLine(lines[i++]));
+    }
     const html = inline(body.join('\n'), env);
     if (excerpt === null) excerpt = html;
     out.push(`<p>${html}</p>\n`);
   }
-  return { html: out.join(''), toc, excerpt: excerpt ?? '' };
+  return { html: out.join(''), toc, excerpt: excerpt ?? '', words };
 }
 
 // ---------------------------------------------------------------- templates
@@ -682,37 +707,131 @@ function lk(S, R, name) {
 }
 
 /**
- * A parsed template's nodes compiled into a render function
- * `fn(R, S, T, D, lk, textOf, truthy, esc)`: `R` the page's values, `S` the
- * loop scopes (innermost last), `T` the compiled templates by name, `D` the
- * include depth. Compiling once per case replaces walking the node tree on
- * every page; the generated code keeps the tree's exact semantics (own
- * properties only, `loop` before the loop's element, includes at most 8 deep).
+ * For each parsed template: whether its output depends only on the case's
+ * constant values (`site`, `tags`, `recent`) — so one render per case serves
+ * every page that includes it. A template is constant when every path in its
+ * inlined tree, read with an empty scope stack, names a constant root or a
+ * name its own `for`s bind. It also needs no `for` anywhere in the case to
+ * bind a constant root (a loop over `site` would shadow it in a caller), and
+ * a template whose includes cycle is never constant. The check is
+ * conservative: a template it calls constant really is one.
  */
-function compileTemplate(nodes) {
+const CONST_ROOTS = new Set(['site', 'tags', 'recent']);
+function analyzeTemplates(parsed) {
+  const boundAnywhere = new Set();
+  for (const nodes of parsed.values()) {
+    const walk = (ns) => {
+      for (const node of ns) {
+        if (node.kind === 'for') {
+          boundAnywhere.add(node.name);
+          walk(node.body);
+        } else if (node.kind === 'if') {
+          walk(node.then);
+          if (node.else !== null) walk(node.else);
+        }
+      }
+    };
+    walk(nodes);
+  }
+  const rootsFree = [...CONST_ROOTS].every((r) => !boundAnywhere.has(r));
+  const info = new Map();
+  for (const [name, nodes] of parsed) {
+    let constant = rootsFree;
+    const stack = [];
+    const seen = new Set([name]);
+    const ok = (path) => CONST_ROOTS.has(path[0]) || stack.includes(path[0]);
+    const walk = (ns) => {
+      for (const node of ns) {
+        if (node.kind === 'for') {
+          if (!ok(node.path)) constant = false;
+          stack.push(node.name, 'loop');
+          walk(node.body);
+          stack.pop();
+          stack.pop();
+        } else if (node.kind === 'if') {
+          if (!ok(node.path)) constant = false;
+          walk(node.then);
+          if (node.else !== null) walk(node.else);
+        } else if (node.kind === 'var' || node.kind === 'raw') {
+          if (!ok(node.path)) constant = false;
+        } else if (node.kind === 'include') {
+          const target = parsed.get(node.name);
+          if (target === undefined) continue;
+          if (seen.has(node.name)) {
+            constant = false;
+            continue;
+          }
+          seen.add(node.name);
+          walk(target);
+          seen.delete(node.name);
+        }
+      }
+    };
+    walk(nodes);
+    info.set(name, constant);
+  }
+  return info;
+}
+
+/**
+ * A parsed template's nodes compiled into a render function
+ * `fn(R, S, T, D, lk, textOf, truthy, esc, C)`: `R` the page's values, `S` the
+ * loop scopes (innermost last), `T` the compiled templates by name, `D` the
+ * include depth, `C` the case's pre-rendered constant templates by name.
+ * Compiling once per case replaces walking the node tree on every page; the
+ * generated code keeps the tree's exact semantics (own properties only,
+ * `loop` before the loop's element, includes at most 8 deep).
+ *
+ * Includes are inlined into the caller, so a page render is one function
+ * call instead of one per partial, and paths hoisted once per render are
+ * shared across the inlined tree. An include of a template already being
+ * inlined (a cycle) falls back to a runtime call at the current depth, which
+ * keeps the depth limit exact; a missing include renders nothing, as before.
+ * A `for` reuses one scope object and one `loop` object per execution of the
+ * statement, mutated per element: the objects are function locals, so a
+ * re-entrant render gets its own, and a template cannot keep a reference to
+ * one past its iteration (it can only read it while rendering).
+ * An include of a constant template is not inlined: it reads the template's
+ * pre-rendered text from `C` when the include is at depth 0 — the depth a
+ * layout's includes run at, and the depth the pre-render ran at, so the
+ * depth limit decides the same inside it — and otherwise renders it fresh.
+ */
+function compileTemplate(name, nodes, allNodes, constant) {
   let n = 0;
   const next = () => `_v${n++}`;
-  // Names a `for` in this template binds, and every path it uses. A path
-  // whose first name no `for` binds resolves the same everywhere in one
-  // render (the page's values never change, and the loop scopes only gain
-  // frames from this template's own `for`s), so it is computed once up front.
+  // Names a `for` in this template's inlined tree binds, and every path it
+  // uses. A path whose first name no `for` in the tree binds resolves the
+  // same everywhere in one render (the page's values never change, and the
+  // loop scopes only gain frames from this tree's own `for`s), so it is
+  // computed once up front.
   const bound = new Set();
   const paths = new Map();
-  const walk = (ns) => {
+  const seen = new Set([name]);
+  const collect = (ns) => {
     for (const node of ns) {
       if (node.kind === 'for') {
         bound.add(node.name);
         bound.add('loop');
         paths.set(node.path.join('.'), node.path);
-        walk(node.body);
+        collect(node.body);
       } else if (node.kind === 'if') {
         paths.set(node.path.join('.'), node.path);
-        walk(node.then);
-        if (node.else !== null) walk(node.else);
+        collect(node.then);
+        if (node.else !== null) collect(node.else);
       } else if (node.kind === 'var' || node.kind === 'raw') paths.set(node.path.join('.'), node.path);
+      else if (node.kind === 'include') {
+        // A constant include is read from C at render time, not executed
+        // here, so its paths and bindings are not this function's.
+        if (constant.get(node.name) === true) continue;
+        const target = allNodes.get(node.name);
+        if (target !== undefined && !seen.has(node.name)) {
+          seen.add(node.name);
+          collect(target);
+        }
+      }
     }
   };
-  walk(nodes);
+  collect(nodes);
   const hoisted = new Map();
   const lines = ['let o = "";'];
   for (const [key, path] of paths) {
@@ -760,6 +879,9 @@ function compileTemplate(nodes) {
   // The variable names the active `for` scopes bind, innermost last (one
   // entry per scope object; each scope also holds `loop`).
   const scopes = [];
+  // The templates being inlined into this function, innermost last: an
+  // include of one of these is a cycle and goes through a runtime call.
+  const inlineStack = [name];
   const emitNodes = (ns) => {
     for (const node of ns) emit(node);
   };
@@ -793,22 +915,42 @@ function compileTemplate(nodes) {
         const t = emitLookup(node.path);
         const xs = next();
         const k = next();
-        lines.push(`{ const ${xs} = ${t}; if (Array.isArray(${xs})) { for (let ${k} = 0; ${k} < ${xs}.length; ${k}++) {`);
-        lines.push(`S.push({ [${JSON.stringify(node.name)}]: ${xs}[${k}], loop: { index: ${k} + 1, first: ${k} === 0, last: ${k} === ${xs}.length - 1, length: ${xs}.length } });`);
+        const sc = next();
+        const lp = next();
+        lines.push(`{ const ${xs} = ${t}; if (Array.isArray(${xs})) { const ${sc} = { [${JSON.stringify(node.name)}]: undefined, loop: null }; const ${lp} = { index: 0, first: false, last: false, length: ${xs}.length }; ${sc}.loop = ${lp}; for (let ${k} = 0; ${k} < ${xs}.length; ${k}++) { ${lp}.index = ${k} + 1; ${lp}.first = ${k} === 0; ${lp}.last = ${k} === ${xs}.length - 1; ${sc}[${JSON.stringify(node.name)}] = ${xs}[${k}]; S.push(${sc});`);
         scopes.push(node.name);
         emitNodes(node.body);
         scopes.pop();
         lines.push(`S.pop(); } } }`);
         break;
       }
-      case 'include':
-        lines.push(`{ const _f = T.get(${JSON.stringify(node.name)}); if (_f !== undefined && D < 8) o += _f(R, S, T, D + 1, lk, textOf, truthy, esc); }`);
+      case 'include': {
+        const target = allNodes.get(node.name);
+        if (target === undefined) break; // a missing include renders nothing
+        if (constant.get(node.name) === true) {
+          // Read the template's pre-rendered text when this include runs at
+          // depth 0 (the depth a layout's includes run at, and the depth the
+          // pre-render ran at, so the depth limit decides the same inside
+          // it); otherwise render it fresh at the current depth.
+          lines.push(`{ if (D === 0) { const _c = C.get(${JSON.stringify(node.name)}); if (_c !== undefined) o += _c; else { const _f = T.get(${JSON.stringify(node.name)}); if (_f !== undefined) o += _f(R, S, T, 1, lk, textOf, truthy, esc, C); } } else if (D < 8) { const _f = T.get(${JSON.stringify(node.name)}); if (_f !== undefined) o += _f(R, S, T, D + 1, lk, textOf, truthy, esc, C); } }`);
+          break;
+        }
+        if (inlineStack.includes(node.name)) {
+          lines.push(`{ const _f = T.get(${JSON.stringify(node.name)}); if (_f !== undefined && D < 8) o += _f(R, S, T, D + 1, lk, textOf, truthy, esc, C); }`);
+          break;
+        }
+        lines.push(`if (D < 8) { D++;`);
+        inlineStack.push(node.name);
+        emitNodes(target);
+        inlineStack.pop();
+        lines.push(`D--; }`);
         break;
+      }
     }
   };
   emitNodes(nodes);
   lines.push('return o;');
-  return new Function('R', 'S', 'T', 'D', 'lk', 'textOf', 'truthy', 'esc', lines.join('\n'));
+  return new Function('R', 'S', 'T', 'D', 'lk', 'textOf', 'truthy', 'esc', 'C', lines.join('\n'));
 }
 
 // ---------------------------------------------------------------- the build
@@ -835,16 +977,20 @@ export function run(input) {
   };
 
   // Templates, parsed and compiled in code-unit order of name; one that does not parse is reported and left out.
-  const templates = new Map();
+  // Parsing comes first so compiling can inline the includes (see compileTemplate).
+  const parsed = new Map();
   const report = [];
   for (const name of Object.keys(input.templates).sort(byCodeUnits)) {
     try {
-      templates.set(name, compileTemplate(parseTemplate(name, input.templates[name])));
+      parsed.set(name, parseTemplate(name, input.templates[name]));
     } catch (err) {
       if (err instanceof TemplateError) report.push(err.message);
       else throw err;
     }
   }
+  const templates = new Map();
+  const constant = analyzeTemplates(parsed);
+  for (const [name, nodes] of parsed) templates.set(name, compileTemplate(name, nodes, parsed, constant));
 
   const base = input.site.base_url.replace(/\/+$/, '');
 
@@ -910,32 +1056,37 @@ export function run(input) {
   }
 
   // Markdown, each body's links resolved to the pages and static files they name.
+  // One link resolver for the case: rendering is sequential, so the source it
+  // resolves for is kept in two variables set before each source is rendered.
   const staticPaths = new Set(statics.map((f) => f.path));
   const broken = new Set();
+  let curDir = '';
+  let curPath = '';
+  const env = {
+    link: (target) => {
+      // A scheme needs a colon; most targets have none, so skip the regex then.
+      if (target[0] === '/' || target[0] === '#' || (target.indexOf(':') !== -1 && SCHEME_RE.test(target))) return target;
+      const hash = target.indexOf('#');
+      const rel = hash === -1 ? target : target.slice(0, hash);
+      const frag = hash === -1 ? '' : target.slice(hash);
+      const path = rel === '' ? null : resolvePath(curDir, rel);
+      if (path !== null) {
+        const page = bySource.get(path);
+        if (page !== undefined) return `${page.url}${frag}`;
+        if (staticPaths.has(path)) return `${base}/${path}${frag}`;
+      }
+      broken.add(`broken-link ${curPath} -> ${target}`);
+      return target;
+    },
+  };
   for (const s of kept) {
-    const dir = dirOf(s.path);
-    const env = {
-      link: (target) => {
-        if (/^[A-Za-z][A-Za-z0-9+.-]*:/.test(target) || target[0] === '/' || target[0] === '#') return target;
-        const hash = target.indexOf('#');
-        const rel = hash === -1 ? target : target.slice(0, hash);
-        const frag = hash === -1 ? '' : target.slice(hash);
-        const path = rel === '' ? null : resolvePath(dir, rel);
-        if (path !== null) {
-          const page = bySource.get(path);
-          if (page !== undefined) return `${page.url}${frag}`;
-          if (staticPaths.has(path)) return `${base}/${path}${frag}`;
-        }
-        broken.add(`broken-link ${s.path} -> ${target}`);
-        return target;
-      },
-    };
+    curDir = dirOf(s.path);
+    curPath = s.path;
     const md = renderMarkdown(s.lines, s.bodyStart, env, slugOf);
     s.html = md.html;
     s.toc = md.toc;
     s.excerpt = md.excerpt;
-    s.words = countWords(s.lines, s.bodyStart);
-    s.readingMinutes = Math.max(1, Math.ceil(s.words / 200));
+    s.readingMinutes = Math.max(1, Math.ceil(md.words / 200));
   }
 
   // Collections: posts newest first, equal dates by slug; each post's neighbours.
@@ -945,16 +1096,25 @@ export function run(input) {
     p.newer = k === 0 ? null : posts[k - 1];
     p.older = k === posts.length - 1 ? null : posts[k + 1];
   });
+  // Each post's neighbour links, built once: a page's record reuses them.
+  const linkOf = (s) => (s === null ? null : { title: s.data.title, url: s.url, date: s.data.date ?? '', date_long: s.data.date === undefined ? '' : longOf(s.data.date) });
+  for (const p of posts) {
+    p.newerLink = linkOf(p.newer);
+    p.olderLink = linkOf(p.older);
+  }
 
   // Tags: grouped by slug, named as first met walking the posts in collection order.
   const bySlug = new Map();
+  // A source's tag names, each slug once (the first spelling kept). A source
+  // holds at most a few tags, so a linear scan beats a Set here.
   const ownTags = (s) => {
-    const seen = new Set();
+    const tags = s.data.tags ?? [];
     const out = [];
-    for (const name of s.data.tags ?? []) {
+    const slugs = [];
+    for (const name of tags) {
       const slug = slugOf(name);
-      if (!seen.has(slug)) {
-        seen.add(slug);
+      if (slugs.indexOf(slug) === -1) {
+        slugs.push(slug);
         out.push(name);
       }
     }
@@ -978,65 +1138,82 @@ export function run(input) {
   }
   const tags = [...bySlug.values()].sort((x, y) => y.posts.length - x.posts.length || byCodeUnits(x.slug, y.slug));
 
-  // The tag cards every record of a page carries, built once per page.
-  for (const s of kept) s.tagCards = s.tagRefs.map((t) => ({ name: t.name, slug: t.slug, url: t.url }));
-  const cardOf = (s) => ({
-    title: s.data.title,
-    url: s.url,
-    date: s.data.date ?? '',
-    date_long: s.data.date === undefined ? '' : longOf(s.data.date),
-    summary: s.data.summary ?? '',
-    excerpt: s.excerpt,
-    reading_minutes: s.readingMinutes,
-    tags: s.tagCards,
-  });
-  const linkOf = (s) => (s === null ? null : { title: s.data.title, url: s.url, date: s.data.date ?? '', date_long: s.data.date === undefined ? '' : longOf(s.data.date) });
-  const pageOf = (s) => ({
-    title: s.data.title,
-    url: s.url,
-    date: s.data.date ?? '',
-    date_long: s.data.date === undefined ? '' : longOf(s.data.date),
-    summary: s.data.summary ?? '',
-    excerpt: s.excerpt,
-    reading_minutes: s.readingMinutes,
-    tags: s.tagCards,
-    slug: s.slug,
-    content: s.html,
-    toc: s.toc,
-    newer: linkOf(s.newer ?? null),
-    older: linkOf(s.older ?? null),
-    is_post: s.post,
-  });
+  // One record per page serves both as its card and as its page: the card
+  // fields and the page fields hold the same values, so a single object
+  // replaces the two objects (and the cards map) the build used to make.
+  for (const s of kept) {
+    s.tagCards = s.tagRefs.map((t) => ({ name: t.name, slug: t.slug, url: t.url }));
+    s.rec = {
+      title: s.data.title,
+      url: s.url,
+      date: s.data.date ?? '',
+      date_long: s.data.date === undefined ? '' : longOf(s.data.date),
+      summary: s.data.summary ?? '',
+      excerpt: s.excerpt,
+      reading_minutes: s.readingMinutes,
+      tags: s.tagCards,
+      slug: s.slug,
+      content: s.html,
+      toc: s.toc,
+      newer: s.post ? s.newerLink : null,
+      older: s.post ? s.olderLink : null,
+      is_post: s.post,
+    };
+  }
 
   // Layouts: every page through its layout, the index pages and the tag pages.
-  const cards = new Map(posts.map((p) => [p, cardOf(p)]));
   const site = { title: input.site.title, base_url: base };
   const allTags = tags.map((t) => ({ name: t.name, slug: t.slug, url: t.url, count: t.posts.length }));
-  const recent = posts.slice(0, input.site.recent).map((p) => cards.get(p));
-  const render = (name, vars) => {
+  const recent = posts.slice(0, input.site.recent).map((p) => p.rec);
+  // One values object, reused for every render: the keys a render does not
+  // use are left undefined, which reads exactly as absent.
+  const R = { site, tags: allTags, recent, page: undefined, posts: undefined, pager: undefined, tag: undefined };
+  // The constant templates, rendered once for the case at depth 1 (the depth
+  // a layout's include of one runs at): every page reuses the same text.
+  const constRenders = new Map();
+  for (const [name, isConstant] of constant) {
+    if (!isConstant) continue;
     const fn = templates.get(name);
-    return fn === undefined ? null : fn(vars, [], templates, 0, lk, textOf, truthy, esc);
+    if (fn !== undefined) constRenders.set(name, fn(R, [], templates, 1, lk, textOf, truthy, esc, constRenders));
+  }
+  const render = (name) => {
+    const fn = templates.get(name);
+    return fn === undefined ? null : fn(R, [], templates, 0, lk, textOf, truthy, esc, constRenders);
   };
   const output = {};
-  for (const s of kept) output[`${s.outDir}/index.html`] = render(s.layout, { site, tags: allTags, recent, page: pageOf(s) });
+  let pageCount = 0;
+  for (const s of kept) {
+    R.page = s.rec;
+    R.posts = undefined;
+    R.pager = undefined;
+    R.tag = undefined;
+    if (!s.post) pageCount++;
+    output[`${s.outDir}/index.html`] = render(s.layout);
+  }
   const per = input.site.per_page;
   const pages = Math.max(1, Math.ceil(posts.length / per));
   const indexUrl = (k) => (k === 1 ? `${base}/` : `${base}/page/${k}/`);
   for (let k = 1; k <= pages; k++) {
-    const html = render('index', {
-      site,
-      tags: allTags,
-      recent,
-      posts: posts.slice((k - 1) * per, k * per).map((p) => cards.get(p)),
-      pager: { number: k, total: pages, url: indexUrl(k), newer_url: k === 1 ? '' : indexUrl(k - 1), older_url: k === pages ? '' : indexUrl(k + 1) },
-    });
+    R.page = undefined;
+    R.posts = posts.slice((k - 1) * per, k * per).map((p) => p.rec);
+    R.pager = { number: k, total: pages, url: indexUrl(k), newer_url: k === 1 ? '' : indexUrl(k - 1), older_url: k === pages ? '' : indexUrl(k + 1) };
+    R.tag = undefined;
+    const html = render('index');
     if (html !== null) output[k === 1 ? 'index.html' : `page/${k}/index.html`] = html;
   }
   for (const t of tags) {
-    const html = render('tag', { site, tags: allTags, recent, tag: { name: t.name, slug: t.slug, url: t.url, count: t.posts.length, posts: t.posts.map((p) => cards.get(p)) } });
+    R.page = undefined;
+    R.posts = undefined;
+    R.pager = undefined;
+    R.tag = { name: t.name, slug: t.slug, url: t.url, count: t.posts.length, posts: t.posts.map((p) => p.rec) };
+    const html = render('tag');
     if (html !== null) output[`tags/${t.slug}/index.html`] = html;
   }
-  const tagsHtml = render('tags', { site, tags: allTags, recent });
+  R.page = undefined;
+  R.posts = undefined;
+  R.pager = undefined;
+  R.tag = undefined;
+  const tagsHtml = render('tags');
   if (tagsHtml !== null) output['tags/index.html'] = tagsHtml;
   for (const f of statics) {
     if (Object.hasOwn(output, f.path)) report.push(`shadowed ${f.path}: a built page has its path`);
@@ -1045,7 +1222,6 @@ export function run(input) {
 
   // The report: every line reported above and each broken link, sorted, then the counts.
   const lines = [...report, ...broken].sort(byCodeUnits);
-  const pageCount = kept.filter((s) => !s.post).length;
   lines.push(`built ${pageCount} pages, ${posts.length} posts, ${tags.length} tags and ${statics.length} static files`);
   output['build-report.txt'] = `${lines.join('\n')}\n`;
   return output;
